@@ -1,20 +1,19 @@
 extern crate ffmpeg_the_third as ffmpeg;
 
-use ab_glyph::{Font, FontArc, PxScale};
+use ab_glyph::{FontArc, PxScale};
 use clap::Parser;
 use image::{ImageBuffer, ImageReader, Rgb};
 use imageproc::drawing::{draw_hollow_rect_mut, draw_text_mut};
 use imageproc::rect::Rect;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use rkod::{
+use yolov8_rknn::{
     cv::FrameExtractor,
     od::RknnAppContext,
     read_lines,
     upload::{UpError, UploaderWorker},
 };
 
-use std::fs::File;
 use std::io::{self, Error, ErrorKind};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;

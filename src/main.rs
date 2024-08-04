@@ -2,14 +2,14 @@ extern crate ffmpeg_the_third as ffmpeg;
 
 use clap::Parser;
 use image::ImageReader;
-use rkod::{
+use std::io::{self, Error, ErrorKind};
+use tracing::{error, info};
+use yolov8_rknn::{
     cv::FrameExtractor,
     od::RknnAppContext,
     read_lines,
     upload::{UpError, UploaderWorker},
 };
-use std::io::{self, Error, ErrorKind};
-use tracing::{error, info};
 
 use ffmpeg::{format, media};
 // use tracing_subscriber::fmt::time::ChronoLocal;

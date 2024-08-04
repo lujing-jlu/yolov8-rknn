@@ -4,16 +4,16 @@ use clap::Parser;
 use image::ImageReader;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use rkod::{
+use std::io::{self, Error, ErrorKind};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{error, info};
+use yolov8_rknn::{
     cv::FrameExtractor,
     od::RknnAppContext,
     read_lines,
     upload::{UpError, UploaderWorker},
 };
-use std::io::{self, Error, ErrorKind};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tracing::{error, info};
 
 use ffmpeg::{format, media};
 // use tracing_subscriber::fmt::time::ChronoLocal;
