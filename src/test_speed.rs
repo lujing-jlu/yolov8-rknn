@@ -44,7 +44,7 @@ fn main() -> io::Result<()> {
         .init();
 
     let args = Args::parse();
-    let lines = read_lines("model/safety_hat.txt")?;
+    let lines = read_lines("model/coco_80_labels_list.txt")?;
     let labels = lines.flatten().collect::<Vec<String>>();
 
     if args.input.starts_with("rtsp") {
@@ -113,7 +113,7 @@ fn main() -> io::Result<()> {
         };
         let img = img.resize_to_fill(
             640,
-            480, // Adjust to your model's input size
+            640, // Adjust to your model's input size
             image::imageops::FilterType::Nearest,
         );
 
@@ -124,7 +124,7 @@ fn main() -> io::Result<()> {
         let start = Instant::now();
 
         let total_inferences = 1000; // Total number of inferences
-        let thread_num = 6;
+        let thread_num = 9;
         let pool = ThreadPoolBuilder::new()
             .num_threads(thread_num)
             .build()

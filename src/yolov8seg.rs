@@ -5,9 +5,9 @@ use image::ImageReader;
 use std::io::{self, Error, ErrorKind};
 use tracing::{error, info};
 use yolov8_rknn::{
-    cv::FrameExtractor,
-    od::RknnAppContext,
+    cv_seg::FrameExtractor,
     read_lines,
+    seg::RknnAppContext,
     upload::{UpError, UploaderWorker},
 };
 
@@ -86,7 +86,7 @@ fn main() -> io::Result<()> {
                 if let Some(r) = frame_extractor.process_frames(&app_ctx)? {
                     let results = r
                         .into_iter()
-                        .map(|(id, prob, f_box)| (labels[id as usize].clone(), prob, f_box))
+                        .map(|(id, prob, f_box, mask)| (labels[id as usize].clone(), prob, f_box))
                         .collect::<Vec<_>>();
 
                     if let Some(upload_worker) = upworker.as_ref() {
@@ -123,7 +123,7 @@ fn main() -> io::Result<()> {
         let results = od_results
             .get_results()
             .into_iter()
-            .map(|(id, prob, f_box)| (labels[id as usize].clone(), prob, f_box))
+            .map(|(id, prob, f_box, mask)| (labels[id as usize].clone(), prob, f_box))
             .collect::<Vec<_>>();
 
         info!("results: {results:?}");

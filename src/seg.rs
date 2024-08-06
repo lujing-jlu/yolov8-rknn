@@ -1,11 +1,4 @@
-use std::{
-    collections::HashSet,
-    fs::File,
-    io::{self, Read, Result},
-    mem::size_of,
-    ptr::null_mut,
-};
-
+use crate::post_process::*;
 use crate::{
     _rknn_query_cmd_RKNN_QUERY_INPUT_ATTR, _rknn_query_cmd_RKNN_QUERY_IN_OUT_NUM,
     _rknn_query_cmd_RKNN_QUERY_OUTPUT_ATTR, _rknn_tensor_format_RKNN_TENSOR_NCHW,
@@ -15,15 +8,28 @@ use crate::{
     rknn_outputs_get, rknn_outputs_release, rknn_query, rknn_run, rknn_tensor_attr,
 };
 use libc::c_void;
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{self, Read, Result},
+    mem::size_of,
+    ptr::null_mut,
+};
 use tracing::{error, info};
-
 // const OBJ_NAME_MAX_SIZE: u8 = 64;
 const OBJ_NUMB_MAX_SIZE: i32 = 128;
-const OBJ_CLASS_NUM: i32 = 2;
+const OBJ_CLASS_NUM: i32 = 80;
 const NMS_THRESH: f32 = 0.45;
 const BOX_THRESH: f32 = 0.25;
 const PROB_THRESHOLD: f32 = 0.2;
-
+const MAP_SIZE: [[i32; 2]; 3] = [[80, 80], [40, 40], [20, 20]];
+const MASK_NUM: i32 = 32;
+const STRIDES: [i32; 3] = [8, 16, 32];
+const SEG_WIDTH: i32 = 160;
+const SEG_HEIGHT: i32 = 160;
+const INPUT_WIDTH: i32 = 640;
+const INPUT_HEIGHT: i32 = 640;
+const HEAD_NUM: i32 = 3;
 // #[derive(Debug, Default, Clone, Copy)]
 // struct ImageRect {
 //     left: i32,
@@ -32,12 +38,38 @@ const PROB_THRESHOLD: f32 = 0.2;
 //     bottom: i32,
 // }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
+pub struct DetectRect {
+    xmin: f32,
+    ymin: f32,
+    xmax: f32,
+    ymax: f32,
+    class_id: Option<usize>,
+    score: f32,
+    mask: Vec<f32>,
+}
+
+impl DetectRect {
+    pub fn new() -> Self {
+        DetectRect {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 0.0,
+            ymax: 0.0,
+            class_id: None,
+            score: 0.0,
+            mask: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 struct ObjectDetection {
     // rect: ImageRect,
     prob: f32,
     cls_id: i32,
     f_box: [f32; 4],
+    mask: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,17 +84,12 @@ impl ObjectDetectList {
         obj_probs: &Vec<f32>,
         order: &Vec<usize>,
         filter_boxes: &Vec<[f32; 4]>,
+        masks: &Vec<Vec<u8>>,
     ) -> Result<Self> {
         if class_id.len() != obj_probs.len() || order.len() != class_id.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "class_id, obj_probs and order should be the same length.",
-            ));
-        }
-        if PROB_THRESHOLD < 0. || PROB_THRESHOLD >= 1. {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "PROB_THRESHOLD should be within range [0,1).",
             ));
         }
         let mut count = 0i32;
@@ -84,6 +111,7 @@ impl ObjectDetectList {
                 prob: obj_probs[n],
                 cls_id: class_id[n],
                 f_box: filter_boxes[n],
+                mask: masks[n].clone(),
             };
             results.push(res);
             count += 1;
@@ -91,10 +119,10 @@ impl ObjectDetectList {
         Ok(Self { count, results })
     }
 
-    pub fn get_results(&self) -> Vec<(i32, f32, [f32; 4])> {
+    pub fn get_results(&self) -> Vec<(i32, f32, [f32; 4], Vec<u8>)> {
         self.results
             .iter()
-            .map(|r| (r.cls_id, r.prob, r.f_box))
+            .map(|r| (r.cls_id, r.prob, r.f_box, r.mask.clone()))
             .collect::<Vec<_>>()
     }
 
@@ -113,6 +141,7 @@ pub struct RknnAppContext {
     model_width: i32,
     model_height: i32,
     is_quant: bool,
+    mesh_grid: Vec<f32>,
 }
 
 impl RknnAppContext {
@@ -125,6 +154,7 @@ impl RknnAppContext {
         let (input_attrs, output_attrs) = (Vec::new(), Vec::new());
         let (model_channel, model_width, model_height) = (0i32, 0i32, 0i32);
         let is_quant = false;
+        let mesh_grid = generate_mesh_grid();
         Self {
             rknn_ctx,
             io_num,
@@ -134,6 +164,7 @@ impl RknnAppContext {
             model_width,
             model_height,
             is_quant,
+            mesh_grid,
         }
     }
 
@@ -147,27 +178,6 @@ impl RknnAppContext {
 
     pub fn init_model(&mut self, path: &str) -> Result<()> {
         let mut ctx: rknn_context = 0;
-
-        // let mut model_raw = 0 as c_char;
-        // let mut model_ptr = &mut model_raw as *mut _;
-        // let model = &mut model_ptr as *mut *mut _;
-        // // let model = Box::into_raw(Box::new(Box::into_raw(model_raw)));
-
-        // // Find absolute path of the model
-        // let dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-        // let path = format!("{}", Path::new(&dir).join(path).display());
-        // let model_path = CString::new(path).unwrap();
-
-        // // Load RKNN Model
-        // let model_len = unsafe { read_data_from_file(model_path.as_ptr(), model) };
-
-        // if model_len < 0 {
-        //     error!("Failed to load rknn model. Return code: {model_len}");
-        //     return Err(io::Error::new(
-        //         io::ErrorKind::InvalidData,
-        //         "Failed to load rknn model",
-        //     ));
-        // }
 
         let mut model = File::open(path)?;
         let mut model_buf: Vec<u8> = Vec::new();
@@ -329,19 +339,6 @@ impl RknnAppContext {
     }
 
     pub fn inference_model(&self, img: &[u8]) -> Result<ObjectDetectList> {
-        // let reader = ImageReader::open(img_path)?;
-        // let img = match reader.decode() {
-        //     Ok(m) => m,
-        //     Err(e) => {
-        //         return Err(Error::new(ErrorKind::InvalidInput, e.to_string()));
-        //     }
-        // };
-        // let img = img.resize_to_fill(
-        //     self.model_width as u32,
-        //     self.model_height as u32,
-        //     image::imageops::FilterType::Nearest,
-        // );
-
         let img_buf = img.as_ptr() as *mut c_void;
         let mut inputs: Vec<rknn_input> = Vec::new();
         for n in 0..self.io_num.n_input {
@@ -383,6 +380,7 @@ impl RknnAppContext {
         }
 
         let mut outputs: Vec<rknn_output> = Vec::new();
+        println!("n_output:{}", self.io_num.n_output);
         for i in 0..self.io_num.n_output {
             let output = rknn_output {
                 index: i,
@@ -404,6 +402,7 @@ impl RknnAppContext {
                 null_mut(),
             )
         };
+
         if ret < 0 {
             error!("Failed to get rknn outputs. Error code: {ret}");
             return Err(io::Error::new(
@@ -420,176 +419,217 @@ impl RknnAppContext {
         let mut filter_boxes: Vec<[f32; 4]> = Vec::new();
         let mut obj_probs: Vec<f32> = Vec::new();
         let mut class_id: Vec<i32> = Vec::new();
-        let dfl_len = self.output_attrs[0].dims[1] / 4;
-        let output_per_branch = self.io_num.n_output / 3;
+        let mut masks: Vec<Vec<Vec<u8>>> = Vec::new();
+
+        // 确保n_output至少为8
+        if outputs.len() < 8 {
+            error!(
+                "Unexpected number of outputs. Expected at least 8, got {}",
+                outputs.len()
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected number of outputs",
+            ));
+        }
+
+        // 存储缩放因子和零点
+        let mut out_scales: Vec<f32> = Vec::new();
+        let mut out_zps: Vec<i32> = Vec::new();
+
+        for i in 0..self.io_num.n_output {
+            out_scales.push(self.output_attrs[i as usize].scale);
+            out_zps.push(self.output_attrs[i as usize].zp);
+        }
+
+        // 创建一个 Vec<*mut i8>，长度为 io_num_n_output
+        let mut pblob: Vec<*mut i8> = vec![std::ptr::null_mut(); self.io_num.n_output as usize];
+
+        // 遍历并设置每个 pblob 元素
+        for (i, output) in outputs.iter().enumerate() {
+            pblob[i] = output.buf as *mut i8;
+        }
+
+        let mut grid_index: i32 = -2;
+        let mut cls_max: f32 = 0.0;
+        let mut cls_index: i32 = 0;
+
+        self.get_conv_detection_result(pblob, out_zps, out_scales);
+    }
+
+    fn get_conv_detection_result(
+        &mut self,
+        pblob: Vec<*mut i8>,
+        qnt_zp: Vec<i32>,
+        qnt_scale: Vec<f32>,
+    ) {
+        let mut detect_rects: Vec<DetectRect> = Vec::new();
+        let mut seg_mask: Vec<Vec<[u8; 3]>> =
+            vec![vec![[0, 0, 0]; SEG_WIDTH as usize]; SEG_HEIGHT as usize];
+
+        let mut ret = 0;
+        if self.mesh_grid.is_empty() {
+            ret = self.generate_mesh_grid();
+        }
+
+        let mut grid_index = 0;
+        let mut xmin = 0.0;
+        let mut ymin = 0.0;
+        let mut xmax = 0.0;
+        let mut ymax = 0.0;
+        let mut cls_val = 0.0;
+        let mut cls_max = 0.0;
+        let mut cls_index = 0;
+
+        let mut quant_zp_cls = 0;
+        let mut quant_zp_reg = 0;
+        let mut quant_zp_msk = 0;
+        let mut quant_zp_seg = 0;
+        let mut quant_scale_cls = 0.0;
+        let mut quant_scale_reg = 0.0;
+        let mut quant_scale_msk = 0.0;
+        let mut quant_scale_seg = 0.0;
+
         for i in 0..3 {
-            let (score_sum, score_sum_zp, score_sum_scale) = if output_per_branch == 3 {
-                (
-                    outputs[i * 3 + 2].buf,
-                    self.output_attrs[i * 3 + 2].zp,
-                    self.output_attrs[i * 3 + 2].scale,
-                )
-            } else {
-                (null_mut() as *mut c_void, 0, 1.0)
-            };
-            let box_idx = i * output_per_branch as usize;
-            let score_idx = i * output_per_branch as usize + 1;
+            let reg = outputs[7 + i].buf as *const i8;
+            let cls = outputs[0 + i].buf as *const i8;
+            let msk = outputs[3 + i].buf as *const i8;
 
-            let grid_h = self.output_attrs[box_idx].dims[2];
-            let grid_w = self.output_attrs[box_idx].dims[3];
-            let stride = self.model_height as u32 / grid_h;
+            // 获取量化参数
+            let quant_zp_reg = self.output_attrs[7 + i].zp;
+            let quant_zp_cls = self.output_attrs[0 + i].zp;
+            let quant_zp_msk = self.output_attrs[3 + i].zp;
 
-            if self.is_quant {
-                // process_i8
-                let grid_len = (grid_h * grid_w) as usize;
-                let score_thres_i8 = qnt_f32_to_affine(
-                    BOX_THRESH,
-                    self.output_attrs[score_idx].zp,
-                    self.output_attrs[score_idx].scale,
-                );
-                let score_sum_thres_i8 =
-                    qnt_f32_to_affine(BOX_THRESH, score_sum_zp, score_sum_scale);
-                for m in 0..grid_h {
-                    for n in 0..grid_w {
-                        let offset = (m * grid_w + n) as usize;
-                        let mut max_cls_id = -1;
+            let quant_scale_reg = self.output_attrs[7 + i].scale;
+            let quant_scale_cls = self.output_attrs[0 + i].scale;
+            let quant_scale_msk = self.output_attrs[3 + i].scale;
 
-                        // 通过 score sum 起到快速过滤的作用
-                        if !score_sum.is_null() {
-                            let buf_offset =
-                                unsafe { *(score_sum.wrapping_add(offset) as *mut i8) };
-                            if buf_offset < score_sum_thres_i8 {
-                                continue;
-                            }
-                        }
+            let mut sfsum: f32;
+            let mut locval: f32;
+            let mut locvaltemp: f32;
+            let mut reg_deq = [0.0f32; 16];
 
-                        let mut max_score = -self.output_attrs[score_idx].zp as i8;
-                        for k in 0..OBJ_CLASS_NUM {
-                            let buf_offset = unsafe {
-                                *(outputs[score_idx]
-                                    .buf
-                                    .wrapping_add(offset + grid_len * k as usize)
-                                    as *mut i8)
+            for h in 0..MAP_SIZE[i][0] {
+                for w in 0..MAP_SIZE[i][1] {
+                    grid_index += 2;
+
+                    if 1 == OBJ_CLASS_NUM {
+                        cls_max = sigmoid(deqnt2f32(
+                            unsafe {
+                                *cls.offset(
+                                    (0 * MAP_SIZE[i][0] * MAP_SIZE[i][1] + h * MAP_SIZE[i][1] + w)
+                                        as isize,
+                                ) as i32
+                            },
+                            quant_zp_cls,
+                            quant_scale_cls,
+                        ));
+                        cls_index = 0;
+                    } else {
+                        for cl in 0..OBJ_CLASS_NUM {
+                            let cls_val = unsafe {
+                                *cls.offset(
+                                    (cl * MAP_SIZE[i][0] * MAP_SIZE[i][1] + h * MAP_SIZE[i][1] + w)
+                                        as isize,
+                                )
                             };
-                            if buf_offset > score_thres_i8 && buf_offset > max_score {
-                                max_score = buf_offset;
-                                max_cls_id = k;
+                            if cl == 0 {
+                                cls_max = cls_val as f32;
+                                cls_index = cl;
+                            } else {
+                                if cls_val > cls_max as i8 {
+                                    cls_max = cls_val as f32;
+                                    cls_index = cl;
+                                }
                             }
-                            // info!("looping in: i: {i}, m: {m}, n: {n}, k:{k}");
                         }
-
-                        // compute box
-                        if max_score > score_thres_i8 {
-                            // let mut offset = (m * grid_w + n) as usize ;
-                            let mut before_dfl: Vec<f32> = Vec::new();
-                            for k in 0..(dfl_len * 4) {
-                                let box_tensor = unsafe {
-                                    *(outputs[box_idx]
-                                        .buf
-                                        .wrapping_add(offset + grid_len * k as usize)
-                                        as *mut i8)
-                                };
-                                let deqnt = (box_tensor as f32
-                                    - self.output_attrs[box_idx].zp as f32)
-                                    * self.output_attrs[box_idx].scale as f32;
-                                before_dfl.push(deqnt);
-                            }
-                            let draw_box = compute_dfl(before_dfl, dfl_len as usize);
-
-                            let x1 = (-draw_box[0] + n as f32 + 0.5) * stride as f32;
-                            let y1 = (-draw_box[1] + m as f32 + 0.5) * stride as f32;
-                            let x2 = (draw_box[2] + n as f32 + 0.5) * stride as f32;
-                            let y2 = (draw_box[3] + m as f32 + 0.5) * stride as f32;
-                            // let w = x2 - x1;
-                            // let h = y2 - y1;
-
-                            filter_boxes.push([x1, y1, x2, y2]);
-
-                            // filter_boxes.push(x1);
-                            // filter_boxes.push(y1);
-                            // filter_boxes.push(w);
-                            // filter_boxes.push(h);
-
-                            let deqnt = (max_score as f32 - self.output_attrs[score_idx].zp as f32)
-                                * self.output_attrs[score_idx].scale as f32;
-
-                            obj_probs.push(deqnt);
-                            class_id.push(max_cls_id);
-                            // valid_count += 1;
-                        }
+                        cls_max = sigmoid(deqnt2f32(cls_max as i32, quant_zp_cls, quant_scale_cls));
                     }
-                }
-            } else {
-                // process_fp32
-                let grid_len = (grid_h * grid_w) as usize;
-                for m in 0..grid_h {
-                    for n in 0..grid_w {
-                        let offset = (m * grid_w + n) as usize;
-                        let mut max_cls_id = -1;
 
-                        // 通过 score sum 起到快速过滤的作用
-                        if !score_sum.is_null() {
-                            let buf_offset =
-                                unsafe { *(score_sum.wrapping_add(offset) as *mut i8) };
-                            if (buf_offset as f32) < BOX_THRESH {
-                                continue;
+                    if cls_max > BOX_THRESH {
+                        let mut reg_dfl = Vec::new();
+                        for lc in 0..4 {
+                            sfsum = 0.0;
+                            locval = 0.0;
+                            for df in 0..16 {
+                                locvaltemp = (deqnt2f32(
+                                    unsafe {
+                                        (*reg.offset(
+                                            ((lc * 16 + df) * MAP_SIZE[i][0] * MAP_SIZE[i][1]
+                                                + h * MAP_SIZE[i][1]
+                                                + w)
+                                                as isize,
+                                        ))
+                                        .into()
+                                    },
+                                    quant_zp_reg,
+                                    quant_scale_reg,
+                                ))
+                                .exp();
+                                reg_deq[df as usize] = locvaltemp;
+                                sfsum += locvaltemp;
                             }
+                            for df in 0..16 {
+                                locvaltemp = reg_deq[df] / sfsum;
+                                locval += locvaltemp * df as f32;
+                            }
+                            reg_dfl.push(locval);
                         }
 
-                        let mut max_score = 0.0f32;
-                        for k in 0..OBJ_CLASS_NUM {
-                            let buf_offset = unsafe {
-                                *(outputs[score_idx]
-                                    .buf
-                                    .wrapping_add(offset + grid_len * k as usize)
-                                    as *mut f32)
-                            };
-                            if buf_offset > BOX_THRESH && buf_offset > max_score {
-                                max_score = buf_offset;
-                                max_cls_id = k;
+                        let stride = STRIDES[i] as f32;
+                        let xmin = (self.mesh_grid[grid_index as usize] - reg_dfl[0]) * stride;
+                        let ymin = (self.mesh_grid[grid_index as usize + 1] - reg_dfl[1]) * stride;
+                        let xmax = (self.mesh_grid[grid_index as usize] + reg_dfl[2]) * stride;
+                        let ymax = (self.mesh_grid[grid_index as usize + 1] + reg_dfl[3]) * stride;
+
+                        let xmin = xmin.max(0.0);
+                        let ymin = ymin.max(0.0);
+                        let xmax = xmax.min(self.model_width as f32);
+                        let ymax = ymax.min(self.model_height as f32);
+
+                        if xmin >= 0.0
+                            && ymin >= 0.0
+                            && xmax <= self.model_width as f32
+                            && ymax <= self.model_height as f32
+                        {
+                            let mut temp = DetectRect::default();
+                            temp.xmin = xmin / self.model_width as f32;
+                            temp.ymin = ymin / self.model_height as f32;
+                            temp.xmax = xmax / self.model_width as f32;
+                            temp.ymax = ymax / self.model_height as f32;
+                            temp.class_id = Some(cls_index as usize);
+                            temp.score = cls_max;
+
+                            for ms in 0..MASK_NUM {
+                                temp.mask.push(deqnt2f32(
+                                    unsafe {
+                                        (*msk.offset(
+                                            (ms * MAP_SIZE[i][0] * MAP_SIZE[i][1]
+                                                + h * MAP_SIZE[i][1]
+                                                + w)
+                                                as isize,
+                                        ))
+                                        .into()
+                                    },
+                                    quant_zp_msk,
+                                    quant_scale_msk,
+                                ));
                             }
-                            // offset += grid_len as usize;
-                        }
-
-                        // compute box
-                        if max_score > BOX_THRESH {
-                            // let mut offset = (m * grid_w + n) as usize ;
-                            let mut before_dfl: Vec<f32> = Vec::new();
-                            for k in 0..(dfl_len * 4) {
-                                let box_tensor = unsafe {
-                                    *(outputs[box_idx]
-                                        .buf
-                                        .wrapping_add(offset + grid_len * k as usize)
-                                        as *mut f32)
-                                };
-                                let deqnt = (box_tensor - self.output_attrs[box_idx].zp as f32)
-                                    * self.output_attrs[box_idx].scale as f32;
-                                before_dfl.push(deqnt);
-                            }
-                            let draw_box = compute_dfl(before_dfl, dfl_len as usize);
-
-                            let x1 = (-draw_box[0] + n as f32 + 0.5) * stride as f32;
-                            let y1 = (-draw_box[1] + m as f32 + 0.5) * stride as f32;
-                            let x2 = (draw_box[2] + n as f32 + 0.5) * stride as f32;
-                            let y2 = (draw_box[3] + m as f32 + 0.5) * stride as f32;
-                            // let w = x2 - x1;
-                            // let h = y2 - y1;
-
-                            filter_boxes.push([x1, y1, x2, y2]);
-
-                            // filter_boxes.push(x1);
-                            // filter_boxes.push(y1);
-                            // filter_boxes.push(w);
-                            // filter_boxes.push(h);
-
-                            obj_probs.push(max_score);
-                            class_id.push(max_cls_id);
-                            // valid_count += 1;
+                            println!("{:?}", temp.mask);
+                            detect_rects.push(temp);
                         }
                     }
                 }
             }
         }
+
+        detect_rects.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let detection_rects = self.process_detections(&mut detect_rects, outputs);
 
         if obj_probs.len() == 0 {
             // warn!("No object detected");
@@ -615,7 +655,13 @@ impl RknnAppContext {
 
         // nms end
 
-        let od_result = match ObjectDetectList::new(&class_id, &obj_probs, &order, &filter_boxes) {
+        let od_result = match ObjectDetectList::new(
+            &class_id,
+            &obj_probs,
+            &order,
+            &filter_boxes,
+            &vec![vec![]],
+        ) {
             Ok(r) => r,
             Err(e) => {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
@@ -629,8 +675,105 @@ impl RknnAppContext {
 
         Ok(od_result)
     }
+
+    fn process_detections(
+        &self,
+        detect_rects: &mut Vec<DetectRect>,
+        seg: Vec<i8>,
+        color_lists: Vec<[u8; 3]>,
+        seg_mask: &mut Vec<Vec<[u8; 3]>>,
+        outputs: Vec<rknn_output>,
+    ) -> Vec<f32> {
+        let mut detection_rects = Vec::new();
+
+        let mut seg_mask: Vec<Vec<[u8; 3]>> = vec![vec![[0, 0, 0]; SEG_WIDTH]; SEG_HEIGHT];
+
+        let seg = outputs[6].buf as *const i8;
+        quant_zp_seg = qnt_zp[6];
+        quant_scale_seg = qnt_scale[6];
+        // 首先处理检测框
+        for i in 0..detect_rects.len() {
+            let xmin1 = detect_rects[i].xmin;
+            let ymin1 = detect_rects[i].ymin;
+            let xmax1 = detect_rects[i].xmax;
+            let ymax1 = detect_rects[i].ymax;
+            let class_id = detect_rects[i].class_id;
+            let score = detect_rects[i].score;
+
+            if let Some(class_id_val) = class_id {
+                // 将检测结果按照class_id、score、xmin1、ymin1、xmax1、ymax1的格式存放在vector<float>中
+                detection_rects.push(class_id_val as f32);
+                detection_rects.push(score);
+                detection_rects.push(xmin1);
+                detection_rects.push(ymin1);
+                detection_rects.push(xmax1);
+                detection_rects.push(ymax1);
+
+                for j in (i + 1)..detect_rects.len() {
+                    let xmin2 = detect_rects[j].xmin;
+                    let ymin2 = detect_rects[j].ymin;
+                    let xmax2 = detect_rects[j].xmax;
+                    let ymax2 = detect_rects[j].ymax;
+                    let iou = iou(xmin1, ymin1, xmax1, ymax1, xmin2, ymin2, xmax2, ymax2);
+                    if iou > NMS_THRESH {
+                        detect_rects[j].class_id = None;
+                    }
+                }
+            }
+        }
+
+        // 然后处理分割掩码
+        for rect in detect_rects.iter() {
+            if let Some(class_id) = rect.class_id {
+                let left = (rect.xmin * SEG_WIDTH as f32 + 0.5) as usize;
+                let top = (rect.ymin * SEG_HEIGHT as f32 + 0.5) as usize;
+                let right = (rect.xmax * SEG_WIDTH as f32 + 0.5) as usize;
+                let bottom = (rect.ymax * SEG_HEIGHT as f32 + 0.5) as usize;
+
+                for h in top..bottom {
+                    for w in left..right {
+                        let mut seg_sum = 0.0;
+                        for s in 0..MASK_NUM {
+                            seg_sum += rect.mask[s as usize]
+                                * deqnt2f32(
+                                    (seg[(s * SEG_WIDTH * SEG_HEIGHT as i32
+                                        + h as i32 * SEG_WIDTH as i32
+                                        + w as i32)
+                                        as usize] as usize)
+                                        .try_into()
+                                        .unwrap(),
+                                    quant_zp_seg,
+                                    quant_scale_seg,
+                                );
+                        }
+
+                        if 1.0 / (1.0 + (-seg_sum).exp()) > 0.5 {
+                            seg_mask[h][w] = color_lists[class_id / 10];
+                        }
+                    }
+                }
+            }
+        }
+
+        detection_rects
+    }
 }
 
+fn generate_mesh_grid() -> Vec<f32> {
+    let mut mesh_grid = Vec::new();
+    for index in 0..3 {
+        for i in 0..MAP_SIZE[index][0] {
+            for j in 0..MAP_SIZE[index][1] {
+                mesh_grid.push(j as f32 + 0.5);
+                mesh_grid.push(i as f32 + 0.5);
+            }
+        }
+    }
+
+    // println!("=== yolov8 mesh_grid Generate success!");
+
+    mesh_grid
+}
 fn qnt_f32_to_affine(threshold: f32, score_zp: i32, score_scale: f32) -> i8 {
     let dst_val = (threshold / score_zp as f32) + score_scale as f32;
     match (dst_val <= -128.0, dst_val >= 127.0) {
@@ -718,4 +861,56 @@ fn cal_overlap(mxy: [f32; 8]) -> f32 {
     } else {
         i / u
     }
+}
+
+// Function to convert raw mask data to a 2D array
+fn convert_to_2d_array(data: &[u8], width: usize, height: usize) -> Vec<Vec<u8>> {
+    let mut mask = vec![vec![0; width]; height];
+    for y in 0..height {
+        for x in 0..width {
+            mask[y][x] = data[y * width + x];
+        }
+    }
+    mask
+}
+
+pub fn deqnt2f32(qnt: i32, zp: i32, scale: f32) -> f32 {
+    (qnt as f32 - zp as f32) * scale
+}
+
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + fast_exp(-x))
+}
+
+pub fn fast_exp(x: f32) -> f32 {
+    let v: u32 = (12102203.1616540672 * x + 1064807160.56887296) as u32;
+    f32::from_bits(v)
+}
+
+pub fn iou(
+    x_min1: f32,
+    y_min1: f32,
+    x_max1: f32,
+    y_max1: f32,
+    x_min2: f32,
+    y_min2: f32,
+    x_max2: f32,
+    y_max2: f32,
+) -> f32 {
+    let x_min = x_min1.max(x_min2);
+    let y_min = y_min1.max(y_min2);
+    let x_max = x_max1.min(x_max2);
+    let y_max = y_max1.min(y_max2);
+
+    let inter_width = (x_max - x_min).max(0.0);
+    let inter_height = (y_max - y_min).max(0.0);
+
+    let inter = inter_width * inter_height;
+
+    let area1 = (x_max1 - x_min1) * (y_max1 - y_min1);
+    let area2 = (x_max2 - x_min2) * (y_max2 - y_min2);
+
+    let total = area1 + area2 - inter;
+
+    inter / total
 }

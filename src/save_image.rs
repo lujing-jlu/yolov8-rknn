@@ -88,7 +88,7 @@ fn main() -> io::Result<()> {
         .init();
 
     let args = Args::parse();
-    let lines = read_lines("model/safety_hat.txt")?;
+    let lines = read_lines("model/coco_80_labels_list.txt")?;
     let labels = lines.flatten().collect::<Vec<String>>();
 
     if args.input.starts_with("rtsp") {

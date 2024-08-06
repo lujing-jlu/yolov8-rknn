@@ -18,6 +18,10 @@ path = "src/test_speed.rs"
 name = "save_image"
 path = "src/save_image.rs"
 
+[[bin]]
+name = "yolov8seg"
+path = "src/yolov8seg.rs"
+
 [dependencies]
 rayon = "1.10.0"
 clap = { version = "4.5", features = ["derive"] }

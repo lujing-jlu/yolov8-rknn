@@ -1,1 +1,1 @@
-cargo run --bin test_speed -- -m model/yolov8m.rknn -i model/bus.jpg
+cargo run --bin test_speed -- -m model/yolov8n.rknn -i model/bus.jpg

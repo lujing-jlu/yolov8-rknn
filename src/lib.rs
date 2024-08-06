@@ -8,8 +8,11 @@ use std::io::{self, BufRead};
 use std::path::Path;
 use tracing::info;
 
-pub mod od;
 pub mod cv;
+pub mod cv_seg;
+pub mod od;
+pub mod post_process;
+pub mod seg;
 pub mod upload;
 
 pub fn dump_tensor_attr(attr: &rknn_tensor_attr) {
